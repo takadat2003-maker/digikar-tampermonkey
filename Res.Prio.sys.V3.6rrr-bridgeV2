@@ -1,0 +1,1415 @@
+// ==UserScript==
+// @name         Res.Prio.sys.V3.6rrr-bridgeV2
+// @namespace    https://digikar.jp/reception/
+// @version      3.6.rrr-bridgeV2
+// @description  診察順ナビ 上位表示パネル版。既存ロジックを維持しつつ Bridging Autopilot V2 向けの橋渡しデータ書き出しを追加。
+// @match        https://digikar.jp/reception/*
+// @match        https://*.digikar.jp/reception/*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const CONFIG = {
+    refreshIntervalMs: 1000,
+    tableScanDebounceMs: 200,
+    initialRetryIntervalMs: 300,
+    initialRetryMax: 30,
+    renderClass: 'tm-priority-score-block-v36',
+
+    storagePrefixBase: 'tmPriorityStateV36::',
+    staleStateTtlMs: 6 * 60 * 60 * 1000,
+    globalGcIntervalMs: 10 * 60 * 1000,
+
+    uiStorageKey: 'tmPriorityUiStateV36',
+    panelId: 'tm-priority-floating-panel-v36',
+    panelTopN: 8,
+
+    urgentTopTag: '🔴緊急対応群',
+    bridgeStorageKey: 'tmBridgeAutopilotFeedV2',
+
+    headers: {
+      reservation: '予約',
+      arrival: '時間',
+      status: 'ステータス',
+      patientNo: ['患者番号', '患者ID', 'ID'],
+      patientName: ['患者氏名', '氏名', '患者名', '名前'],
+      patientMemo: '患者メモ',
+      receptionMemo: '受付メモ',
+      department: '診療科',
+      doctor: '医師',
+      initial: '初'
+    },
+
+    waitingStatuses: ['診察待'],
+    visibleStatuses: ['受付中', '受付済', '診察待', '診察中', '再診待', '検査中', '検査待', '検査戻り', '処置待', '処置中'],
+    inactiveStatusKeywords: ['会計', '帰宅', '完了', '中止', '取消', 'キャンセル'],
+
+    targetDepartments: [
+      '整形外科（1診）',
+      '整形外科（2診）',
+      '脊椎外来（1診）',
+      'リハあり診察',
+      '中待合室',
+      '中待合',
+      'ワクチン・採血・薬他（処置室）',
+      '予約なし診察（受付前待ち）'
+    ],
+
+    doctorTimeRegex: /(院長|担当医|医師)?\s*[（(]?\s*(\d{1,2})\s*:\s*(\d{2})\s*[)）]?/,
+    anyTimeRegex: /(\d{1,2})\s*:\s*(\d{2})/,
+
+    score: {
+      sameSlotReserved: 40,
+      nextSlotReserved: 35,
+      overdueReserved: 42,
+      futureReserved: 24,
+      walkInRevisit: 20,
+      walkInInitial: 10,
+      waitPerMinute: 0.8,
+      overduePerMinute: 0.6,
+      sameSlotSoonBonus: 10,
+      nextSlotSoonBonus: 5,
+      shortVisitStrong: 15,
+      shortVisitWeak: 10,
+      complaint1: 10,
+      complaint2: 20,
+      complaint3: 30,
+      safetyUrgent: 1000,
+      imagingReadyBonus: 3
+    },
+
+    shortVisitKeywordsStrong: [
+      '注射のみ', '処方のみ', '結果説明のみ', '書類のみ', 'brief', 'クイック', '短時間', 'リハ後診察のみ'
+    ],
+    shortVisitKeywordsWeak: [
+      '注射', '処方', '結果説明', '薬のみ', '物療のみ', 'リハのみ', '再チェックのみ'
+    ],
+
+    imagingKeywords: ['🌈', 'RX', 'ＲＸ', 'Xp', 'XP', 'ＸＰ', 'レントゲン', '骨密度', '撮影'],
+    urgentKeywords: ['救急', '倒れ', '気分不良', '出血', '啼泣', '動けない', '歩行不可', '処置室', '激痛', 'しびれ急増'],
+    complaintKeywords2: ['クレーム', '怒', '不満強い', '大声', '要注意'],
+    complaintKeywords3: ['🔥', '激怒', '暴言', 'トラブル', '強いクレーム'],
+
+    colors: {
+      top1: '#b91c1c',
+      top2: '#c2410c',
+      top3: '#92400e',
+      normal: '#1d4ed8',
+      waitingStatus: '#2563eb',
+      waitingRoom: '#2563eb',
+      examiningStatus: '#0f8b8d',
+      border: '#d1d5db',
+      bg: '#f8fafc',
+      waitingBg: '#eef6ff',
+      activeBg: '#f8fafc',
+      urgentTopBg: '#fee2e2',
+      urgentTopBorder: '#dc2626',
+      rankBadgeBg1: '#fee2e2',
+      rankBadgeBg2: '#ffedd5',
+      rankBadgeBg3: '#fef3c7',
+      rankBadgeBg: '#dbeafe',
+      panelHeader: '#1e3a8a',
+      panelBg: 'rgba(255,255,255,0.97)',
+      panelShadow: '0 12px 28px rgba(0,0,0,0.18)',
+      sortOn: '#166534',
+      sortOnBg: '#dcfce7',
+      sortOff: '#6b7280',
+      sortOffBg: '#f3f4f6',
+      navOn: '#7c2d12',
+      navOnBg: '#ffedd5',
+      navOff: '#6b7280',
+      navOffBg: '#f3f4f6'
+    }
+  };
+
+  function getTodayKey() {
+    const d = new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}${m}${day}`;
+  }
+
+  function getStoragePrefix() {
+    return `${CONFIG.storagePrefixBase}${getTodayKey()}::`;
+  }
+
+  function normalizeHeaderText(text) {
+    return String(text || '').replace(/\s+/g, '').trim();
+  }
+
+  function normalizeCompareText(text) {
+    return String(text || '').replace(/\s+/g, '').trim();
+  }
+
+  function escapeHtml(text) {
+    return String(text || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function round1(n) {
+    return Math.round(n * 10) / 10;
+  }
+
+  function formatScore(score) {
+    return round1(score).toFixed(1);
+  }
+
+  function formatDuration(ms) {
+    const totalSec = Math.max(0, Math.floor(ms / 1000));
+    const mm = Math.floor(totalSec / 60);
+    const ss = totalSec % 60;
+    return `${String(mm)}:${String(ss).padStart(2, '0')}`;
+  }
+
+  function parseHHMM(text) {
+    const m = String(text || '').match(CONFIG.anyTimeRegex);
+    if (!m) return null;
+    const hh = Number(m[1]);
+    const mm = Number(m[2]);
+    if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
+    return { hh, mm };
+  }
+
+  function todayAt(hh, mm) {
+    const d = new Date();
+    d.setHours(hh, mm, 0, 0);
+    return d;
+  }
+
+  function includesAny(text, keywords) {
+    return keywords.some(keyword => String(text || '').includes(keyword));
+  }
+
+  function countComplaintLevel(text) {
+    const source = String(text || '');
+    if (!source) return 0;
+    const explicitCount = (source.match(/💢/g) || []).length;
+    if (includesAny(source, CONFIG.complaintKeywords3)) return 3;
+    if (explicitCount >= 2 || includesAny(source, CONFIG.complaintKeywords2)) return 2;
+    if (explicitCount >= 1) return 1;
+    return 0;
+  }
+
+  function isInitialVisit(initialText) {
+    return String(initialText || '').trim() !== '';
+  }
+
+  function isTargetDepartment(departmentText) {
+    const normalized = normalizeCompareText(departmentText);
+    return CONFIG.targetDepartments.some(dep => normalizeCompareText(dep) === normalized);
+  }
+
+  function isTrackableStatus(statusText) {
+    const text = String(statusText || '').trim();
+    if (!text) return false;
+    if (CONFIG.inactiveStatusKeywords.some(keyword => text.includes(keyword))) return false;
+    if (CONFIG.visibleStatuses.includes(text)) return true;
+    return /(待|中)/.test(text) && !CONFIG.inactiveStatusKeywords.some(keyword => text.includes(keyword));
+  }
+
+  function isWaitingStatus(statusText) {
+    return normalizeCompareText(statusText) === normalizeCompareText('診察待');
+  }
+
+  function isExaminingStatus(statusText) {
+    return normalizeCompareText(statusText) === normalizeCompareText('診察中');
+  }
+
+  function getPatientSituation(departmentText, statusText) {
+    const dep = normalizeCompareText(departmentText);
+    const st = normalizeCompareText(statusText);
+
+    if (dep === normalizeCompareText('整形外科（1診）') && st === normalizeCompareText('診察待')) return '受付前で待機';
+    if (dep === normalizeCompareText('整形外科（2診）') && st === normalizeCompareText('診察待')) return '受付前で待機';
+    if (dep === normalizeCompareText('予約なし診察（受付前待ち）') && st === normalizeCompareText('診察待')) return '受付前で待機';
+    if (dep === normalizeCompareText('リハあり診察') && st === normalizeCompareText('診察待')) return '受付前で待機';
+    if (dep === normalizeCompareText('脊椎外来（1診）') && st === normalizeCompareText('診察待')) return '受付前で待機';
+    if ((dep === normalizeCompareText('中待合') || dep === normalizeCompareText('中待合室')) && st === normalizeCompareText('診察待')) return '中待合で待機';
+    if (dep === normalizeCompareText('整形外科（1診）') && st === normalizeCompareText('診察中')) return '1診で診察中';
+    if (dep === normalizeCompareText('整形外科（2診）') && st === normalizeCompareText('診察中')) return '2診で診察中';
+    return '';
+  }
+
+  function getSituationColor(departmentText, statusText, isUrgentTop) {
+    const dep = normalizeCompareText(departmentText);
+    const st = normalizeCompareText(statusText);
+
+    if (isUrgentTop) return CONFIG.colors.urgentTopBorder;
+    if (st === normalizeCompareText('診察中')) return CONFIG.colors.examiningStatus;
+    if ((dep === normalizeCompareText('中待合') || dep === normalizeCompareText('中待合室')) && st === normalizeCompareText('診察待')) {
+      return CONFIG.colors.waitingStatus;
+    }
+    return CONFIG.colors.top1;
+  }
+
+  function shouldRender(statusText) {
+    return isWaitingStatus(statusText) || isExaminingStatus(statusText);
+  }
+
+  function getStorageKey(patientNo) {
+    return `${getStoragePrefix()}${patientNo}`;
+  }
+
+  function loadState(patientNo) {
+    if (!patientNo) return null;
+    try {
+      const raw = localStorage.getItem(getStorageKey(patientNo));
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function saveState(patientNo, state) {
+    if (!patientNo) return;
+    try {
+      localStorage.setItem(getStorageKey(patientNo), JSON.stringify(state));
+    } catch (e) {}
+  }
+
+  function deleteState(patientNo) {
+    if (!patientNo) return;
+    try {
+      localStorage.removeItem(getStorageKey(patientNo));
+    } catch (e) {}
+  }
+
+  function getDefaultUiState() {
+    return {
+      top: 16,
+      left: Math.max(8, window.innerWidth - 430),
+      minimized: false,
+      sortEnabled: false,
+      navEnabled: true
+    };
+  }
+
+  function loadUiState() {
+    try {
+      const raw = localStorage.getItem(CONFIG.uiStorageKey);
+      return Object.assign({}, getDefaultUiState(), raw ? JSON.parse(raw) : {});
+    } catch (e) {
+      return getDefaultUiState();
+    }
+  }
+
+  function saveUiState(state) {
+    try {
+      localStorage.setItem(CONFIG.uiStorageKey, JSON.stringify(state));
+    } catch (e) {}
+  }
+
+  function updateUiState(patch) {
+    const next = Object.assign({}, loadUiState(), patch || {});
+    if (!next.navEnabled) next.sortEnabled = false;
+    saveUiState(next);
+    return next;
+  }
+
+  function clampPanelPosition(state, panelEl) {
+    const width = panelEl ? panelEl.offsetWidth : 410;
+    const headerHeight = 48;
+    const maxLeft = Math.max(0, window.innerWidth - width - 4);
+    const maxTop = Math.max(0, window.innerHeight - headerHeight - 4);
+
+    return {
+      top: Math.min(Math.max(0, Number(state.top) || 0), maxTop),
+      left: Math.min(Math.max(0, Number(state.left) || 0), maxLeft),
+      minimized: !!state.minimized,
+      sortEnabled: !!state.sortEnabled && !!state.navEnabled,
+      navEnabled: !!state.navEnabled
+    };
+  }
+
+  function findMainTable() {
+    const tables = Array.from(document.querySelectorAll('table'));
+    let best = null;
+    let bestScore = -Infinity;
+
+    for (const table of tables) {
+      const rows = table.querySelectorAll('tbody tr').length;
+      if (!rows) continue;
+
+      const text = table.innerText || '';
+      let score = rows;
+      if (text.includes(CONFIG.headers.patientMemo)) score += 80;
+      if (text.includes(CONFIG.headers.receptionMemo)) score += 40;
+      if (text.includes(CONFIG.headers.status)) score += 30;
+      if (text.includes(CONFIG.headers.arrival)) score += 20;
+      if (text.includes(CONFIG.headers.reservation)) score += 20;
+      if (text.includes(CONFIG.headers.patientNo[0])) score += 10;
+
+      if (score > bestScore) {
+        bestScore = score;
+        best = table;
+      }
+    }
+    return best;
+  }
+
+  function getHeaderCells(table) {
+    const thead = table.querySelector('thead');
+    if (thead) return Array.from(thead.querySelectorAll('th,td'));
+    const firstRow = table.querySelector('tr');
+    return firstRow ? Array.from(firstRow.querySelectorAll('th,td')) : [];
+  }
+
+  function findColumnIndex(table, header) {
+    const target = normalizeHeaderText(header);
+    const cells = getHeaderCells(table);
+    for (let i = 0; i < cells.length; i += 1) {
+      const cellText = normalizeHeaderText(cells[i].textContent || '');
+      if (cellText === target) return i;
+    }
+    return -1;
+  }
+
+  function findColumnIndexFromList(table, headers) {
+    for (const header of headers) {
+      const idx = findColumnIndex(table, header);
+      if (idx >= 0) return idx;
+    }
+    return -1;
+  }
+
+  function pickColumns(table) {
+    return {
+      reservation: findColumnIndex(table, CONFIG.headers.reservation),
+      arrival: findColumnIndex(table, CONFIG.headers.arrival),
+      status: findColumnIndex(table, CONFIG.headers.status),
+      patientNo: findColumnIndexFromList(table, CONFIG.headers.patientNo),
+      patientName: findColumnIndexFromList(table, CONFIG.headers.patientName),
+      patientMemo: findColumnIndex(table, CONFIG.headers.patientMemo),
+      receptionMemo: findColumnIndex(table, CONFIG.headers.receptionMemo),
+      department: findColumnIndex(table, CONFIG.headers.department),
+      doctor: findColumnIndex(table, CONFIG.headers.doctor),
+      initial: findColumnIndex(table, CONFIG.headers.initial)
+    };
+  }
+
+  function getCellText(tds, idx) {
+    if (idx < 0 || !tds[idx]) return '';
+    return String(tds[idx].textContent || '').replace(/\u00a0/g, ' ').trim();
+  }
+
+  function parseReservedTime(reservationText, receptionMemoText, patientMemoText) {
+    const direct = parseHHMM(reservationText);
+    if (direct) return direct;
+
+    const joined = `${receptionMemoText || ''}\n${patientMemoText || ''}`;
+    let m = joined.match(CONFIG.doctorTimeRegex);
+    if (m) return { hh: Number(m[2]), mm: Number(m[3]) };
+
+    m = joined.match(CONFIG.anyTimeRegex);
+    if (m) return { hh: Number(m[1]), mm: Number(m[2]) };
+
+    return null;
+  }
+
+  function removeRender(cell) {
+    if (!cell) return;
+    const old = cell.querySelector(`.${CONFIG.renderClass}`);
+    if (old) old.remove();
+  }
+
+  function ensureRender(cell) {
+    let el = cell.querySelector(`.${CONFIG.renderClass}`);
+    if (!el) {
+      el = document.createElement('div');
+      el.className = CONFIG.renderClass;
+      el.style.marginTop = '4px';
+      el.style.padding = '4px 6px';
+      el.style.border = `1px solid ${CONFIG.colors.border}`;
+      el.style.borderRadius = '6px';
+      el.style.background = CONFIG.colors.bg;
+      el.style.whiteSpace = 'normal';
+      el.style.lineHeight = '1.28';
+      el.style.fontSize = '12px';
+      cell.appendChild(el);
+    }
+    return el;
+  }
+
+  function updateRenderElement(el, html, title, stylePatch, signature) {
+    if (!el) return;
+    const sig = String(signature || '');
+
+    if (el.dataset.renderSignature !== sig) {
+      el.innerHTML = html;
+      el.dataset.renderSignature = sig;
+    }
+
+    if (el.title !== title) {
+      el.title = title;
+    }
+
+    if (stylePatch) {
+      if (el.dataset.color !== String(stylePatch.color || '')) {
+        el.style.color = stylePatch.color || '';
+        el.dataset.color = String(stylePatch.color || '');
+      }
+      if (el.dataset.fontWeight !== String(stylePatch.fontWeight || '')) {
+        el.style.fontWeight = stylePatch.fontWeight || '';
+        el.dataset.fontWeight = String(stylePatch.fontWeight || '');
+      }
+      if (el.dataset.borderColor !== String(stylePatch.borderColor || '')) {
+        el.style.borderColor = stylePatch.borderColor || '';
+        el.dataset.borderColor = String(stylePatch.borderColor || '');
+      }
+      if (el.dataset.background !== String(stylePatch.background || '')) {
+        el.style.background = stylePatch.background || '';
+        el.dataset.background = String(stylePatch.background || '');
+      }
+    }
+  }
+
+  function clearAllOldRenders(table, cols) {
+    if (!table) return;
+    table.querySelectorAll('tbody tr').forEach(row => {
+      const tds = row.querySelectorAll('td');
+      if (!tds.length) return;
+      const patientMemoCell = cols.patientMemo >= 0 ? tds[cols.patientMemo] : null;
+      const receptionMemoCell = cols.receptionMemo >= 0 ? tds[cols.receptionMemo] : null;
+      removeRender(patientMemoCell);
+      if (receptionMemoCell !== patientMemoCell) removeRender(receptionMemoCell);
+    });
+  }
+
+  function updateTransitionState(patientNo, statusText, arrivalAt, nowMs) {
+    if (!patientNo) return null;
+
+    const prev = loadState(patientNo) || {};
+    const prevStatus = String(prev.lastStatus || '').trim();
+    const currentStatus = String(statusText || '').trim();
+
+    const waitingNow = isWaitingStatus(currentStatus);
+    const waitingPrev = isWaitingStatus(prevStatus);
+
+    let totalStartAt = prev.totalStartAt || null;
+    let currentWaitingStartAt = prev.currentWaitingStartAt || null;
+
+    if (!totalStartAt && arrivalAt) {
+      totalStartAt = arrivalAt.getTime();
+    }
+    if (!totalStartAt) {
+      totalStartAt = nowMs;
+    }
+
+    if (waitingNow && !waitingPrev) {
+      currentWaitingStartAt = nowMs;
+    }
+
+    if (waitingNow && !currentWaitingStartAt) {
+      currentWaitingStartAt = arrivalAt ? arrivalAt.getTime() : totalStartAt;
+    }
+
+    const nextState = {
+      lastStatus: currentStatus,
+      lastSeenAt: nowMs,
+      totalStartAt,
+      currentWaitingStartAt
+    };
+
+    saveState(patientNo, nextState);
+    return nextState;
+  }
+
+  function cleanupMissingRows(seenPatientNos) {
+    const prefix = getStoragePrefix();
+    const now = Date.now();
+    const removeKeys = [];
+
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const k = localStorage.key(i);
+      if (!k || !k.startsWith(prefix)) continue;
+
+      const patientNo = k.slice(prefix.length);
+      if (seenPatientNos.has(patientNo)) continue;
+
+      try {
+        const raw = localStorage.getItem(k);
+        const state = raw ? JSON.parse(raw) : null;
+        const lastSeenAt = state && state.lastSeenAt ? Number(state.lastSeenAt) : 0;
+
+        if (!lastSeenAt || now - lastSeenAt > CONFIG.staleStateTtlMs) {
+          removeKeys.push(k);
+        }
+      } catch (e) {
+        removeKeys.push(k);
+      }
+    }
+
+    removeKeys.forEach(k => {
+      try {
+        localStorage.removeItem(k);
+      } catch (e) {}
+    });
+  }
+
+  function cleanupOldDatePrefixes() {
+    const todayPrefix = getStoragePrefix();
+    const removeKeys = [];
+
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const k = localStorage.key(i);
+      if (!k) continue;
+      if (!k.startsWith(CONFIG.storagePrefixBase)) continue;
+      if (k.startsWith(todayPrefix)) continue;
+      removeKeys.push(k);
+    }
+
+    removeKeys.forEach(k => {
+      try {
+        localStorage.removeItem(k);
+      } catch (e) {}
+    });
+  }
+
+  function buildRowData(row, cols, now) {
+    const tds = row.querySelectorAll('td');
+    if (!tds || !tds.length) return null;
+
+    const statusText = getCellText(tds, cols.status);
+    const patientMemoText = getCellText(tds, cols.patientMemo);
+    const receptionMemoText = getCellText(tds, cols.receptionMemo);
+    const reservationText = getCellText(tds, cols.reservation);
+    const arrivalText = getCellText(tds, cols.arrival);
+    const patientNoText = getCellText(tds, cols.patientNo);
+    const patientNameText = getCellText(tds, cols.patientName);
+    const departmentText = getCellText(tds, cols.department);
+    const doctorText = getCellText(tds, cols.doctor);
+    const initialText = getCellText(tds, cols.initial);
+
+    const displayCell = cols.patientMemo >= 0 ? tds[cols.patientMemo] : (cols.receptionMemo >= 0 ? tds[cols.receptionMemo] : null);
+    if (!displayCell) return null;
+
+    const targetDept = isTargetDepartment(departmentText);
+    const trackableStatus = isTrackableStatus(statusText);
+    const waitingNow = isWaitingStatus(statusText);
+    const examiningNow = isExaminingStatus(statusText);
+
+    const isUrgentTop = waitingNow && String(receptionMemoText || '').includes(CONFIG.urgentTopTag);
+    const situationText = getPatientSituation(departmentText, statusText);
+    const situationColor = getSituationColor(departmentText, statusText, isUrgentTop);
+
+    if (!targetDept) {
+      removeRender(displayCell);
+      return null;
+    }
+
+    if (patientNoText && CONFIG.inactiveStatusKeywords.some(keyword => String(statusText).includes(keyword))) {
+      removeRender(displayCell);
+      deleteState(patientNoText);
+      return null;
+    }
+
+    const arrivalParsed = parseHHMM(arrivalText);
+    const reservedParsed = parseReservedTime(reservationText, receptionMemoText, patientMemoText);
+    const arrivalAt = arrivalParsed ? todayAt(arrivalParsed.hh, arrivalParsed.mm) : null;
+    const reservedAt = reservedParsed ? todayAt(reservedParsed.hh, reservedParsed.mm) : null;
+    const nowMs = now.getTime();
+
+    if (trackableStatus) {
+      updateTransitionState(patientNoText, statusText, arrivalAt, nowMs);
+    }
+
+    if (!shouldRender(statusText)) {
+      removeRender(displayCell);
+      return null;
+    }
+
+    if (examiningNow) {
+      return {
+        mode: 'examining',
+        row,
+        displayCell,
+        patientNoText,
+        patientNameText,
+        departmentText,
+        doctorText,
+        statusText,
+        situationText,
+        situationColor,
+        receptionMemoText
+      };
+    }
+
+    const state = loadState(patientNoText) || updateTransitionState(patientNoText, statusText, arrivalAt, nowMs) || {};
+    const totalStartAtMs = state.totalStartAt || (arrivalAt ? arrivalAt.getTime() : nowMs);
+    const currentWaitingStartAtMs = state.currentWaitingStartAt || (arrivalAt ? arrivalAt.getTime() : nowMs);
+
+    const totalWaitMs = Math.max(0, nowMs - totalStartAtMs);
+    const currentWaitMs = waitingNow ? Math.max(0, nowMs - currentWaitingStartAtMs) : 0;
+
+    const currentWaitMin = currentWaitMs / 60000;
+    const initial = isInitialVisit(initialText);
+    const joinedMemo = `${patientMemoText}\n${receptionMemoText}`;
+    const complaintLevel = countComplaintLevel(joinedMemo);
+    const hasImaging = includesAny(joinedMemo, CONFIG.imagingKeywords);
+    const isUrgent = includesAny(joinedMemo, CONFIG.urgentKeywords);
+    const hasShortStrong = includesAny(joinedMemo, CONFIG.shortVisitKeywordsStrong);
+    const hasShortWeak = !hasShortStrong && includesAny(joinedMemo, CONFIG.shortVisitKeywordsWeak);
+
+    const slotMin = initial ? 10 : 5;
+    const untilReservedMin = reservedAt ? (reservedAt.getTime() - nowMs) / 60000 : null;
+    const overdueReservedMin = reservedAt ? Math.max(0, (nowMs - reservedAt.getTime()) / 60000) : 0;
+
+    let base = 0;
+    let baseLabel = '';
+
+    if (reservedAt) {
+      if (untilReservedMin < 0) {
+        base = CONFIG.score.overdueReserved;
+        baseLabel = '予約超過';
+      } else if (untilReservedMin <= slotMin) {
+        base = CONFIG.score.sameSlotReserved;
+        baseLabel = '同枠予約';
+      } else if (untilReservedMin <= slotMin * 2) {
+        base = CONFIG.score.nextSlotReserved;
+        baseLabel = '次枠予約';
+      } else {
+        base = CONFIG.score.futureReserved;
+        baseLabel = '将来枠予約';
+      }
+    } else {
+      base = initial ? CONFIG.score.walkInInitial : CONFIG.score.walkInRevisit;
+      baseLabel = initial ? '予約外初診' : '予約外再診';
+    }
+
+    const waitScore = round1(currentWaitMin * CONFIG.score.waitPerMinute);
+
+    let timePressureScore = 0;
+    if (reservedAt) {
+      if (untilReservedMin < 0) {
+        timePressureScore = round1(Math.min(30, overdueReservedMin * CONFIG.score.overduePerMinute));
+      } else if (untilReservedMin <= 5) {
+        timePressureScore = CONFIG.score.sameSlotSoonBonus;
+      } else if (untilReservedMin <= 10) {
+        timePressureScore = CONFIG.score.nextSlotSoonBonus;
+      }
+    }
+
+    let shortBonus = 0;
+    if (hasShortStrong) {
+      shortBonus = CONFIG.score.shortVisitStrong;
+    } else if (hasShortWeak) {
+      shortBonus = CONFIG.score.shortVisitWeak;
+    }
+
+    let complaintScore = 0;
+    if (complaintLevel === 1) complaintScore = CONFIG.score.complaint1;
+    if (complaintLevel === 2) complaintScore = CONFIG.score.complaint2;
+    if (complaintLevel >= 3) complaintScore = CONFIG.score.complaint3;
+
+    let imagingBonus = 0;
+    if (initial && hasImaging) {
+      imagingBonus = CONFIG.score.imagingReadyBonus;
+    }
+
+    const safetyScore = isUrgent ? CONFIG.score.safetyUrgent : 0;
+    const totalScore = base + waitScore + timePressureScore + shortBonus + complaintScore + imagingBonus + safetyScore;
+
+    const detailParts = [];
+    if (isUrgentTop) detailParts.push('緊急対応群=無条件最優先');
+    detailParts.push(`${baseLabel}+${formatScore(base)}`);
+    detailParts.push(`今回待+${formatScore(waitScore)}`);
+    if (timePressureScore) detailParts.push(`圧+${formatScore(timePressureScore)}`);
+    if (shortBonus) detailParts.push(`短時間+${formatScore(shortBonus)}`);
+    if (complaintScore) detailParts.push(`💢+${formatScore(complaintScore)}`);
+    if (imagingBonus) detailParts.push(`画像+${formatScore(imagingBonus)}`);
+    if (safetyScore) detailParts.push(`安全+${formatScore(safetyScore)}`);
+
+    return {
+      mode: 'waiting',
+      row,
+      displayCell,
+      patientNoText,
+      patientNameText,
+      departmentText,
+      doctorText,
+      statusText,
+      reservationText,
+      receptionMemoText,
+      patientMemoText,
+      currentWaitMs,
+      totalWaitMs,
+      score: totalScore,
+      detailText: detailParts.join(' / '),
+      situationText,
+      situationColor,
+      isUrgentTop,
+      sortReservedAt: reservedAt ? reservedAt.getTime() : Number.MAX_SAFE_INTEGER,
+      sortArrivalAt: arrivalAt ? arrivalAt.getTime() : Number.MAX_SAFE_INTEGER
+    };
+  }
+
+  function compareRows(a, b) {
+    if (a.isUrgentTop && !b.isUrgentTop) return -1;
+    if (!a.isUrgentTop && b.isUrgentTop) return 1;
+
+    if (a.isUrgentTop && b.isUrgentTop) {
+      if (b.currentWaitMs !== a.currentWaitMs) return b.currentWaitMs - a.currentWaitMs;
+      if (a.sortReservedAt !== b.sortReservedAt) return a.sortReservedAt - b.sortReservedAt;
+      if (a.sortArrivalAt !== b.sortArrivalAt) return a.sortArrivalAt - b.sortArrivalAt;
+      return String(a.patientNoText || '').localeCompare(String(b.patientNoText || ''), 'ja');
+    }
+
+    if (b.score !== a.score) return b.score - a.score;
+    if (a.sortReservedAt !== b.sortReservedAt) return a.sortReservedAt - b.sortReservedAt;
+    if (a.sortArrivalAt !== b.sortArrivalAt) return a.sortArrivalAt - b.sortArrivalAt;
+    return String(a.patientNoText || '').localeCompare(String(b.patientNoText || ''), 'ja');
+  }
+
+  function getRankColor(rank, isUrgentTop) {
+    if (isUrgentTop) return CONFIG.colors.urgentTopBorder;
+    if (rank === 1) return CONFIG.colors.top1;
+    if (rank === 2) return CONFIG.colors.top2;
+    if (rank === 3) return CONFIG.colors.top3;
+    return CONFIG.colors.normal;
+  }
+
+  function getRankBadgeBg(rank, isUrgentTop) {
+    if (isUrgentTop) return CONFIG.colors.urgentTopBg;
+    if (rank === 1) return CONFIG.colors.rankBadgeBg1;
+    if (rank === 2) return CONFIG.colors.rankBadgeBg2;
+    if (rank === 3) return CONFIG.colors.rankBadgeBg3;
+    return CONFIG.colors.rankBadgeBg;
+  }
+
+  function renderWaitingRow(item, rank) {
+    const el = ensureRender(item.displayCell);
+
+    const rankColor = getRankColor(rank, item.isUrgentTop);
+    const rankBadgeBg = getRankBadgeBg(rank, item.isUrgentTop);
+    const reservedStr = item.reservationText && item.reservationText !== '-' ? item.reservationText : '予約外';
+    const currentWaitStr = formatDuration(item.currentWaitMs);
+    const totalWaitStr = formatDuration(item.totalWaitMs);
+    const situation = escapeHtml(item.situationText || '');
+    const rankLabel = item.isUrgentTop ? '緊急1位' : `診察順${rank}位`;
+    const scoreLabel = item.isUrgentTop ? '無条件最優先' : `${escapeHtml(formatScore(item.score))}点`;
+
+    const html =
+      `<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">` +
+        `<span style="display:inline-block;padding:1px 6px;border-radius:999px;background:${rankBadgeBg};color:${rankColor};font-weight:900;font-size:13px;letter-spacing:0.2px;">${escapeHtml(rankLabel)}</span>` +
+        `<span style="color:${rankColor};font-weight:900;font-size:13px;">${scoreLabel}</span>` +
+        `<span style="color:${item.situationColor};font-weight:800;">ー${situation}ー</span>` +
+      `</div>` +
+      `<div style="margin-top:2px;font-weight:700;color:#dc2626;">⌚今回待${escapeHtml(currentWaitStr)}` +
+      `<span style="margin-left:8px;color:#7c3aed;">⌚総待ち${escapeHtml(totalWaitStr)}</span>` +
+      `<span style="margin-left:8px;color:#111827;">予${escapeHtml(reservedStr)}</span></div>`;
+
+    const title =
+      `${item.detailText}\n` +
+      `状態:${item.statusText}\n` +
+      `診療科:${item.departmentText}\n` +
+      `医師:${item.doctorText}` +
+      (item.situationText ? `\n状況:${item.situationText}` : '') +
+      (item.receptionMemoText ? `\n受付メモ:${item.receptionMemoText}` : '');
+
+    const signature = [
+      'waiting',
+      rank,
+      item.isUrgentTop ? '1' : '0',
+      formatDuration(item.currentWaitMs),
+      formatDuration(item.totalWaitMs),
+      reservedStr,
+      formatScore(item.score),
+      item.situationText,
+      item.situationColor,
+      item.statusText,
+      item.departmentText,
+      item.doctorText,
+      item.detailText,
+      item.receptionMemoText
+    ].join('|');
+
+    updateRenderElement(
+      el,
+      html,
+      title,
+      {
+        color: '#111827',
+        fontWeight: '700',
+        borderColor: rankColor,
+        background: item.isUrgentTop ? CONFIG.colors.urgentTopBg : CONFIG.colors.waitingBg
+      },
+      signature
+    );
+  }
+
+  function renderExaminingRow(item) {
+    const el = ensureRender(item.displayCell);
+    const text = escapeHtml(item.situationText || '診察中');
+    const html = `<div style="color:${item.situationColor};font-weight:800;">ー${text}ー</div>`;
+
+    const title =
+      `状態:${item.statusText}\n` +
+      `診療科:${item.departmentText}\n` +
+      `医師:${item.doctorText}` +
+      (item.situationText ? `\n状況:${item.situationText}` : '');
+
+    const signature = [
+      'examining',
+      item.statusText,
+      item.departmentText,
+      item.doctorText,
+      item.situationText,
+      item.situationColor
+    ].join('|');
+
+    updateRenderElement(
+      el,
+      html,
+      title,
+      {
+        color: item.situationColor,
+        fontWeight: '800',
+        borderColor: item.situationColor,
+        background: CONFIG.colors.activeBg
+      },
+      signature
+    );
+  }
+
+  function createPanel() {
+    let panel = document.getElementById(CONFIG.panelId);
+    if (panel) return panel;
+
+    panel = document.createElement('div');
+    panel.id = CONFIG.panelId;
+    panel.style.position = 'fixed';
+    panel.style.zIndex = '999999';
+    panel.style.width = '273px';
+    panel.style.maxWidth = 'calc(100vw - 8px)';
+    panel.style.background = CONFIG.colors.panelBg;
+    panel.style.border = `1px solid ${CONFIG.colors.border}`;
+    panel.style.borderRadius = '12px';
+    panel.style.boxShadow = CONFIG.colors.panelShadow;
+    panel.style.backdropFilter = 'blur(3px)';
+    panel.style.overflow = 'hidden';
+    panel.style.fontFamily = 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+
+    panel.innerHTML = `
+      <div class="tm-panel-header" style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:${CONFIG.colors.panelHeader};color:#fff;cursor:move;user-select:none;">
+        <div style="display:flex;align-items:center;gap:8px;min-width:0;">
+          <span style="font-size:15px;font-weight:900;white-space:nowrap;">診察順ナビ</span>
+        </div>
+        <div style="display:flex;gap:6px;align-items:center;">
+          <button type="button" class="tm-panel-nav-btn" title="ナビON/OFF" style="border:none;border-radius:8px;padding:4px 8px;background:rgba(255,255,255,0.18);color:#fff;font-size:12px;font-weight:800;cursor:pointer;">NAV ON</button>
+          <button type="button" class="tm-panel-sort-btn" title="ソートON/OFF" style="border:none;border-radius:8px;padding:4px 8px;background:rgba(255,255,255,0.18);color:#fff;font-size:12px;font-weight:800;cursor:pointer;">SORT OFF</button>
+          <button type="button" class="tm-panel-min-btn" title="最小化/展開" style="border:none;border-radius:8px;padding:4px 8px;background:rgba(255,255,255,0.18);color:#fff;font-size:12px;font-weight:700;cursor:pointer;">−</button>
+        </div>
+      </div>
+      <div class="tm-panel-body" style="padding:10px 10px 12px 10px;max-height:70vh;overflow:auto;background:${CONFIG.colors.panelBg};">
+        <div class="tm-panel-summary" style="font-size:12px;color:#374151;margin-bottom:8px;">診察待の上位患者を表示</div>
+        <div class="tm-panel-list"></div>
+      </div>
+    `;
+
+    document.body.appendChild(panel);
+    installPanelBehavior(panel);
+    applyUiStateToPanel(panel, loadUiState());
+
+    return panel;
+  }
+
+  function applyUiStateToPanel(panel, state) {
+    const safe = clampPanelPosition(state, panel);
+    panel.style.left = `${safe.left}px`;
+    panel.style.top = `${safe.top}px`;
+
+    const body = panel.querySelector('.tm-panel-body');
+    const minBtn = panel.querySelector('.tm-panel-min-btn');
+    const sortBtn = panel.querySelector('.tm-panel-sort-btn');
+    const navBtn = panel.querySelector('.tm-panel-nav-btn');
+
+    if (safe.minimized) {
+      body.style.display = 'none';
+      minBtn.textContent = '□';
+      minBtn.title = '展開';
+    } else {
+      body.style.display = '';
+      minBtn.textContent = '−';
+      minBtn.title = '最小化';
+    }
+
+    if (safe.navEnabled) {
+      navBtn.textContent = 'NAV ON';
+      navBtn.title = 'ナビON';
+      navBtn.style.background = CONFIG.colors.navOnBg;
+      navBtn.style.color = CONFIG.colors.navOn;
+    } else {
+      navBtn.textContent = 'NAV OFF';
+      navBtn.title = 'ナビOFF';
+      navBtn.style.background = CONFIG.colors.navOffBg;
+      navBtn.style.color = CONFIG.colors.navOff;
+    }
+
+    if (safe.sortEnabled && safe.navEnabled) {
+      sortBtn.textContent = 'SORT ON';
+      sortBtn.title = 'ソートON';
+      sortBtn.style.background = CONFIG.colors.sortOnBg;
+      sortBtn.style.color = CONFIG.colors.sortOn;
+      sortBtn.style.opacity = '1';
+      sortBtn.disabled = false;
+      sortBtn.style.cursor = 'pointer';
+    } else {
+      sortBtn.textContent = 'SORT OFF';
+      sortBtn.title = safe.navEnabled ? 'ソートOFF' : 'ナビOFF中';
+      sortBtn.style.background = CONFIG.colors.sortOffBg;
+      sortBtn.style.color = CONFIG.colors.sortOff;
+      sortBtn.style.opacity = safe.navEnabled ? '1' : '0.55';
+      sortBtn.disabled = !safe.navEnabled;
+      sortBtn.style.cursor = safe.navEnabled ? 'pointer' : 'not-allowed';
+    }
+
+    saveUiState(safe);
+  }
+
+  function installPanelBehavior(panel) {
+    const header = panel.querySelector('.tm-panel-header');
+    const minBtn = panel.querySelector('.tm-panel-min-btn');
+    const sortBtn = panel.querySelector('.tm-panel-sort-btn');
+    const navBtn = panel.querySelector('.tm-panel-nav-btn');
+
+    minBtn.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      const state = loadUiState();
+      state.minimized = !state.minimized;
+      state.top = parseInt(panel.style.top || '0', 10) || 0;
+      state.left = parseInt(panel.style.left || '0', 10) || 0;
+      applyUiStateToPanel(panel, state);
+    });
+
+    sortBtn.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      const state = loadUiState();
+      if (!state.navEnabled) return;
+      state.sortEnabled = !state.sortEnabled;
+      state.top = parseInt(panel.style.top || '0', 10) || 0;
+      state.left = parseInt(panel.style.left || '0', 10) || 0;
+      applyUiStateToPanel(panel, state);
+      scheduleUpdate();
+    });
+
+    navBtn.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      const state = loadUiState();
+      state.navEnabled = !state.navEnabled;
+      if (!state.navEnabled) state.sortEnabled = false;
+      state.top = parseInt(panel.style.top || '0', 10) || 0;
+      state.left = parseInt(panel.style.left || '0', 10) || 0;
+      applyUiStateToPanel(panel, state);
+      scheduleUpdate();
+    });
+
+    let dragging = false;
+    let startX = 0;
+    let startY = 0;
+    let panelLeft = 0;
+    let panelTop = 0;
+
+    function onMove(ev) {
+      if (!dragging) return;
+      const currentX = ev.clientX;
+      const currentY = ev.clientY;
+      const nextLeft = panelLeft + (currentX - startX);
+      const nextTop = panelTop + (currentY - startY);
+      const state = clampPanelPosition({
+        left: nextLeft,
+        top: nextTop,
+        minimized: loadUiState().minimized,
+        sortEnabled: loadUiState().sortEnabled,
+        navEnabled: loadUiState().navEnabled
+      }, panel);
+      panel.style.left = `${state.left}px`;
+      panel.style.top = `${state.top}px`;
+    }
+
+    function onUp() {
+      if (!dragging) return;
+      dragging = false;
+      document.removeEventListener('pointermove', onMove);
+      document.removeEventListener('pointerup', onUp);
+      document.body.style.userSelect = '';
+
+      updateUiState({
+        left: parseInt(panel.style.left || '0', 10) || 0,
+        top: parseInt(panel.style.top || '0', 10) || 0
+      });
+    }
+
+    header.addEventListener('pointerdown', function (ev) {
+      if (ev.target && ev.target.closest('button')) return;
+      dragging = true;
+      startX = ev.clientX;
+      startY = ev.clientY;
+      panelLeft = parseInt(panel.style.left || '0', 10) || 0;
+      panelTop = parseInt(panel.style.top || '0', 10) || 0;
+
+      document.addEventListener('pointermove', onMove);
+      document.addEventListener('pointerup', onUp);
+      document.body.style.userSelect = 'none';
+    });
+
+    window.addEventListener('resize', function () {
+      applyUiStateToPanel(panel, loadUiState());
+    });
+  }
+
+  function renderPanel(waitingItems, examiningItems) {
+    const panel = createPanel();
+    const listEl = panel.querySelector('.tm-panel-list');
+    const summaryEl = panel.querySelector('.tm-panel-summary');
+    if (!listEl || !summaryEl) return;
+
+    const uiState = loadUiState();
+
+    if (!uiState.navEnabled) {
+      summaryEl.innerHTML =
+        `<span style="font-weight:700;color:${CONFIG.colors.navOff};">診察順ナビ停止中</span>`;
+      listEl.innerHTML = `
+        <div style="padding:14px 10px;border:1px dashed ${CONFIG.colors.border};border-radius:10px;background:#fff;color:#6b7280;font-size:13px;">
+          NAV OFF のため、診察順表示・患者メモ欄表示・本表ソートを停止しています。
+        </div>
+      `;
+      return;
+    }
+
+    const topItems = waitingItems.slice(0, CONFIG.panelTopN);
+    const examCount = examiningItems.length;
+    const waitingTotalCount = waitingItems.length;
+    const frontWaitingCount = countFrontWaiting(waitingItems);
+    const middleWaitingCount = countMiddleWaiting(waitingItems);
+    const returnGroupCount = countReturnGroup(waitingItems);
+    const urgentCount = waitingItems.filter(item => item.isUrgentTop).length;
+
+    summaryEl.innerHTML =
+      `<span style="color:${CONFIG.colors.examiningStatus};font-weight:800;">診察中${examCount}名</span>` +
+      `　診察待 <b>${topItems.length}</b>名表示 / 全<b>${waitingTotalCount}</b>名` +
+      `　受付前待 <b>${frontWaitingCount}</b>名` +
+      `　中待合待 <b>${middleWaitingCount}</b>名` +
+      `　再帰群 <b>${returnGroupCount}</b>名` +
+      (urgentCount ? `　<span style="color:${CONFIG.colors.urgentTopBorder};font-weight:800;">緊急対応群${urgentCount}名</span>` : '') +
+      `　<span style="font-weight:700;color:${uiState.sortEnabled ? CONFIG.colors.sortOn : CONFIG.colors.sortOff};">${uiState.sortEnabled ? '本表ソート中' : '本表通常順'}</span>`;
+
+    let html = '';
+
+    if (examiningItems.length) {
+      html += examiningItems.map((item) => {
+        const name = item.patientNameText || `患者番号 ${item.patientNoText || ''}`;
+        return `
+          <div
+            title="${escapeHtml(`状態:${item.statusText}\n診療科:${item.departmentText}\n医師:${item.doctorText}`)}"
+            style="margin-bottom:8px;padding:10px;border:1px solid ${item.situationColor};border-radius:10px;background:${CONFIG.colors.activeBg};">
+            <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+              <span style="display:inline-block;padding:2px 7px;border-radius:999px;background:#ccfbf1;color:${item.situationColor};font-weight:900;font-size:12px;">診察中</span>
+              <span style="font-weight:800;color:#111827;">${escapeHtml(name)}</span>
+            </div>
+            <div style="margin-top:4px;font-size:12px;color:${item.situationColor};font-weight:800;">ー${escapeHtml(item.situationText || '診察中')}ー</div>
+            <div style="margin-top:4px;font-size:12px;color:#111827;">${escapeHtml(item.departmentText || '')}</div>
+            <div style="margin-top:4px;font-size:12px;color:#374151;">${item.patientNoText ? `ID:${escapeHtml(item.patientNoText)}` : ''}</div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    if (!topItems.length && !examiningItems.length) {
+      listEl.innerHTML = `
+        <div style="padding:14px 10px;border:1px dashed ${CONFIG.colors.border};border-radius:10px;background:#fff;color:#6b7280;font-size:13px;">
+          対象患者はいません
+        </div>
+      `;
+      return;
+    }
+
+    html += topItems.map((item, idx) => {
+      const rank = idx + 1;
+      const rankColor = getRankColor(rank, item.isUrgentTop);
+      const rankBg = getRankBadgeBg(rank, item.isUrgentTop);
+      const reservedStr = item.reservationText && item.reservationText !== '-' ? item.reservationText : '予約外';
+      const name = item.patientNameText || `患者番号 ${item.patientNoText || ''}`;
+      const currentWaitStr = formatDuration(item.currentWaitMs);
+      const totalWaitStr = formatDuration(item.totalWaitMs);
+      const rankLabel = item.isUrgentTop ? '緊急1位' : `${rank}位`;
+      const scoreLabel = item.isUrgentTop ? '無条件最優先' : `${escapeHtml(formatScore(item.score))}点`;
+
+      return `
+        <div title="${escapeHtml(item.detailText)}"
+             style="margin-bottom:8px;padding:10px;border:1px solid ${rankColor};border-radius:10px;background:${item.isUrgentTop ? CONFIG.colors.urgentTopBg : '#fff'};">
+          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+            <span style="display:inline-block;padding:2px 7px;border-radius:999px;background:${rankBg};color:${rankColor};font-weight:900;font-size:12px;">${escapeHtml(rankLabel)}</span>
+            <span style="color:${rankColor};font-weight:900;font-size:13px;">${scoreLabel}</span>
+            <span style="font-weight:800;color:#111827;">${escapeHtml(name)}</span>
+          </div>
+          <div style="margin-top:4px;font-size:12px;color:${item.situationColor};font-weight:800;">ー${escapeHtml(item.situationText || '')}ー</div>
+          <div style="margin-top:4px;font-size:12px;color:#111827;">${escapeHtml(item.departmentText || '')}</div>
+          <div style="margin-top:4px;font-size:12px;color:#dc2626;font-weight:700;">⌚今回待${escapeHtml(currentWaitStr)}
+            <span style="margin-left:8px;color:#7c3aed;">⌚総待ち${escapeHtml(totalWaitStr)}</span>
+          </div>
+          <div style="margin-top:4px;font-size:12px;color:#374151;">
+            予${escapeHtml(reservedStr)}
+            ${item.patientNoText ? `<span style="margin-left:8px;">ID:${escapeHtml(item.patientNoText)}</span>` : ''}
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    listEl.innerHTML = html;
+  }
+
+  function applySortToTable(table, waitingItems, examiningItems) {
+    if (!table) return;
+    const tbody = table.querySelector('tbody');
+    if (!tbody) return;
+
+    const uiState = loadUiState();
+    if (!uiState.navEnabled || !uiState.sortEnabled) return;
+
+    const allRows = Array.from(tbody.querySelectorAll(':scope > tr'));
+    if (!allRows.length) return;
+
+    const waitingRowSet = new Set(waitingItems.map(item => item.row));
+    const examiningRowSet = new Set(examiningItems.map(item => item.row));
+
+    const waitingSortedRows = waitingItems.map(item => item.row);
+    const examiningRows = examiningItems.map(item => item.row);
+
+    const untouchedRows = allRows.filter(row => {
+      return !waitingRowSet.has(row) && !examiningRowSet.has(row);
+    });
+
+    const finalRows = [];
+    let inserted = false;
+
+    for (const row of untouchedRows) {
+      if (!inserted) {
+        finalRows.push(...examiningRows);
+        finalRows.push(...waitingSortedRows);
+        inserted = true;
+      }
+      finalRows.push(row);
+    }
+
+    if (!inserted) {
+      finalRows.push(...examiningRows);
+      finalRows.push(...waitingSortedRows);
+    }
+
+    const seen = new Set();
+    finalRows.forEach(row => {
+      if (!row || seen.has(row)) return;
+      seen.add(row);
+      tbody.appendChild(row);
+    });
+  }
+
+  function isBridgeFrontWaitingItem(item) {
+    return item &&
+      item.mode === 'waiting' &&
+      normalizeCompareText(item.situationText) === normalizeCompareText('受付前で待機');
+  }
+
+  function isBridgeMiddleWaitingItem(item) {
+    return item &&
+      item.mode === 'waiting' &&
+      normalizeCompareText(item.situationText) === normalizeCompareText('中待合で待機');
+  }
+
+  function isReturnGroupItem(item) {
+    if (!item || item.mode !== 'waiting') return false;
+
+    const dep = normalizeCompareText(item.departmentText || '');
+    const status = normalizeCompareText(item.statusText || '');
+    const memo = `${item.receptionMemoText || ''}\n${item.patientMemoText || ''}`;
+
+    if (dep === normalizeCompareText('中待合') || dep === normalizeCompareText('中待合室')) {
+      return true;
+    }
+
+    if (status.includes(normalizeCompareText('再診待')) || status.includes(normalizeCompareText('検査戻り'))) {
+      return true;
+    }
+
+    if (/(リハ後|リハ戻り|レントゲン後|XP後|RX後|撮影後|検査戻り)/.test(memo)) {
+      return true;
+    }
+
+    return false;
+  }
+
+  function isBridgeReturnGroupItem(item) {
+    return isReturnGroupItem(item);
+  }
+
+  function countFrontWaiting(waitingItems) {
+    return waitingItems.filter(isBridgeFrontWaitingItem).length;
+  }
+
+  function countMiddleWaiting(waitingItems) {
+    return waitingItems.filter(isBridgeMiddleWaitingItem).length;
+  }
+
+  function countReturnGroup(waitingItems) {
+    return waitingItems.filter(isBridgeReturnGroupItem).length;
+  }
+
+  function mapBridgePatient(item) {
+    return {
+      patientNo: item.patientNoText || '',
+      patientName: item.patientNameText || '',
+      department: item.departmentText || '',
+      status: item.statusText || '',
+      situation: item.situationText || ''
+    };
+  }
+
+  function buildBridgePayload(waitingItems, examiningItems) {
+    const frontWaitingItems = waitingItems.filter(isBridgeFrontWaitingItem);
+    const middleWaitingItems = waitingItems.filter(isBridgeMiddleWaitingItem);
+    const returnGroupItems = waitingItems.filter(isBridgeReturnGroupItem);
+
+    return {
+      version: '2.0.0',
+      source: 'Res.Prio.sys.V3.6rrr',
+      writtenAt: new Date().toISOString(),
+      counts: {
+        frontWaiting: countFrontWaiting(waitingItems),
+        frontWaitingTarget: 6,
+        middleWaiting: countMiddleWaiting(waitingItems),
+        middleWaitingTarget: 3,
+        returnGroup: countReturnGroup(waitingItems),
+        examining: examiningItems.length,
+        waitingTotal: waitingItems.length
+      },
+      patients: {
+        frontWaiting: frontWaitingItems.map(mapBridgePatient),
+        middleWaiting: middleWaitingItems.map(mapBridgePatient),
+        returnGroup: returnGroupItems.map(mapBridgePatient)
+      }
+    };
+  }
+
+  function writeBridgePayload(payload) {
+    try {
+      localStorage.setItem(CONFIG.bridgeStorageKey, JSON.stringify(payload));
+    } catch (e) {
+      console.warn('Bridge payload write failed:', e);
+    }
+  }
+
+  function updateOnce() {
+    const table = findMainTable();
+    if (!table) return false;
+
+    const cols = pickColumns(table);
+    if (cols.status < 0 || (cols.patientMemo < 0 && cols.receptionMemo < 0) || cols.patientNo < 0 || cols.department < 0) return false;
+
+    const now = new Date();
+    const waitingItems = [];
+    const examiningItems = [];
+    const seenPatientNos = new Set();
+    const uiState = loadUiState();
+
+    table.querySelectorAll('tbody tr').forEach(row => {
+      const tds = row.querySelectorAll('td');
+      if (!tds || !tds.length) return;
+
+      const patientNoText = getCellText(tds, cols.patientNo);
+      if (patientNoText) seenPatientNos.add(patientNoText);
+
+      const item = buildRowData(row, cols, now);
+      if (!item) return;
+
+      if (item.mode === 'waiting') waitingItems.push(item);
+      if (item.mode === 'examining') examiningItems.push(item);
+    });
+
+    waitingItems.sort(compareRows);
+
+    if (uiState.navEnabled) {
+      applySortToTable(table, waitingItems, examiningItems);
+
+      waitingItems.forEach((item, idx) => {
+        renderWaitingRow(item, idx + 1);
+      });
+
+      examiningItems.forEach(item => {
+        renderExaminingRow(item);
+      });
+    } else {
+      clearAllOldRenders(table, cols);
+    }
+
+    const bridgePayload = buildBridgePayload(waitingItems, examiningItems);
+    writeBridgePayload(bridgePayload);
+
+    renderPanel(waitingItems, examiningItems);
+    cleanupMissingRows(seenPatientNos);
+    return true;
+  }
+
+  let scheduled = false;
+  let lastGlobalGcAt = 0;
+  let initCompleted = false;
+
+  function scheduleUpdate() {
+    if (scheduled) return;
+    scheduled = true;
+    window.setTimeout(() => {
+      scheduled = false;
+      updateOnce();
+    }, CONFIG.tableScanDebounceMs);
+  }
+
+  function periodicHouseKeeping() {
+    const now = Date.now();
+    if (now - lastGlobalGcAt >= CONFIG.globalGcIntervalMs) {
+      lastGlobalGcAt = now;
+      cleanupOldDatePrefixes();
+    }
+  }
+
+  function waitForTableAndInit(retry = 0) {
+    const ok = updateOnce();
+    if (ok) {
+      initCompleted = true;
+      return;
+    }
+    if (retry < CONFIG.initialRetryMax) {
+      window.setTimeout(() => waitForTableAndInit(retry + 1), CONFIG.initialRetryIntervalMs);
+    }
+  }
+
+  function startObserversWhenReady() {
+    const start = () => {
+      const observer = new MutationObserver(scheduleUpdate);
+      observer.observe(document.body, { childList: true, subtree: true });
+
+      cleanupOldDatePrefixes();
+      createPanel();
+      waitForTableAndInit();
+
+      window.setInterval(() => {
+        periodicHouseKeeping();
+        updateOnce();
+      }, CONFIG.refreshIntervalMs);
+    };
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', start, { once: true });
+    } else {
+      start();
+    }
+  }
+
+  startObserversWhenReady();
+})();
